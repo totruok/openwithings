@@ -1,0 +1,8 @@
+#!/bin/bash
+# Copy to run-daemon.sh, fill in your values, chmod 700. Keeps secrets out of the unit and out of git.
+cd ~/withings_ble
+exec ./venv/bin/python -u withings_daemon.py \
+  --address 00:24:E4:XX:XX:XX --out measurements.jsonl \
+  --delete --disable-wifi --setup-ok \
+  --secret <kl from withings_klsecret.py> \
+  --upload-args "--userid <userid> --mac 00:24:e4:xx:xx:xx"

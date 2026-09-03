@@ -1,0 +1,16 @@
+[Unit]
+Description=openwithings — Withings scale BLE collector
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/withings_ble
+ExecStartPre=-/usr/bin/bluetoothctl power on
+ExecStart=%h/withings_ble/run-daemon.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:%h/withings_ble/daemon.log
+StandardError=append:%h/withings_ble/daemon.log
+
+[Install]
+WantedBy=default.target

@@ -167,6 +167,24 @@ Run `sudo btmon -w capture.snoop` in the background during any experiment and re
 `btmon -r capture.snoop | grep -E "SMP:|ATT:|Reason:|Supervision"`. Then match what you see against
 `docs/bluez-pitfalls.md`. Everything else is guessing.
 
+### 9. Run it as a service (systemd, survives reboots)
+
+Copy `tools/run-daemon.sh.example` to `~/withings_ble/run-daemon.sh`, fill in your MAC, `kl` secret and
+userid, `chmod 700` it (this keeps the secret out of the unit file and out of git). Then install
+`tools/openwithings.service` as a user unit:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp tools/openwithings.service ~/.config/systemd/user/
+loginctl enable-linger "$USER"          # so it runs without an active login session
+systemctl --user daemon-reload
+systemctl --user enable --now openwithings.service
+systemctl --user status openwithings.service
+```
+
+Logs go to `~/withings_ble/daemon.log`. The BlueZ settings from step 2 and the bond from step 4 persist
+across reboots, so nothing else needs re-doing.
+
 ## Layout
 
 - `tools/withings_probe.py` — WPP framing, TLV decoding, probe/challenge, stored-measure commands, pairing helper.
@@ -174,6 +192,7 @@ Run `sudo btmon -w capture.snoop` in the background during any experiment and re
 - `tools/withings_upload.py` — measurements → Withings cloud (`cgi-bin/measure action=store`, the scale's own format).
 - `tools/withings_klsecret.py` — fetch the scale's `kl` secret and your userid from the Withings cloud.
 - `tools/mgmt_fix.py`, `tools/agent.sh` — BlueZ plumbing (per-device connection parameters, auto-accepting agent).
+- `tools/openwithings.service`, `tools/run-daemon.sh.example` — systemd user unit to run the collector on boot.
 - `docs/protocol.md` — everything we know about WPP as spoken by the scale.
 - `docs/bluez-pitfalls.md` — the dozen ways a Linux box fails to talk to this scale, and the fix for each.
 - `references/` — third-party sources the work is built on (see `references/SOURCES.md`).
