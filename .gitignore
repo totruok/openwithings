@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.jsonl
+uploaded.json
+*.log
+*.snoop
+.withings_session.json
+.withings_auth.json
+agent.out
+agent.answers
