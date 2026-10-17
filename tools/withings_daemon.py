@@ -26,8 +26,12 @@ CMD_WIFI_SETTINGS = 265
 CMD_CONNECT_REASON = 273
 CMD_SYNC_OK = 277
 CMD_COMM_SUPPORT = 281
+CMD_UPDATE_USER_INFO = 276
+CMD_SCALE_MEDAPP_USER_INFO = 307
 T_CONNECT_REASON = 280
 T_WIFI_ENABLE = 270
+T_USER_INFO = 282
+T_SCALE_MEDAPP_USER_INFO = 308
 REASONS = {0: "UNKNOWN", 1: "USER_REQ", 2: "DEVICE_REQ", 3: "FIRM_UPDATE", 4: "READY_TO_UPDATE",
            5: "RESCUE_FW", 6: "TRAINING", 7: "EVENT", 8: "BAT_LVL_INFO", 9: "WUP_SYNC_REQ", 10: "FEATURE_TAGS_SYNC"}
 
@@ -36,8 +40,34 @@ def log(*a):
     print(datetime.now().strftime("%H:%M:%S"), *a, flush=True)
 
 
+async def provision(link: wp.Link, prov: dict):
+    """Сброшенные весы (смена батареек) забывают kl и профиль: пишем их обратно, как Health Mate при настройке.
+    prov: {"account_id", "kl", "adv_key", "user": {"userId", "name", "height_cm", "age", "sex", "fatmethod"}}"""
+    def answer(fr):
+        tl = [(t, v.hex()) for t, v in wp.tlvs_of(fr)]
+        err = [wp.decode(t, bytes.fromhex(v)) for t, v in tl if t == wp.T_CMDERROR]
+        return f"ERROR {err}" if err else (tl or "echo")
+
+    fr = await link.transact(wp.frame(wp.CMD_ASSOCIATION_KEYS_SET,
+                                      wp.tlv(wp.T_ACCOUNT_KEY, struct.pack(">I", prov["account_id"]) + wp.wstr(prov["kl"])),
+                                      wp.tlv(wp.T_ADV_KEY, wp.wstr(prov["adv_key"]))), first=6.0, idle=1.0)
+    log("ASSOCIATION_KEYS_SET →", answer(fr))
+    u = prov.get("user")
+    if not u:
+        return
+    fr = await link.transact(wp.frame(CMD_UPDATE_USER_INFO,
+                                      wp.tlv(T_USER_INFO, wp.wstr(u["name"]) + struct.pack(">II", u["userId"], 0))),
+                             first=6.0, idle=1.0)
+    log("UPDATE_USER_INFO →", answer(fr))
+    fr = await link.transact(wp.frame(CMD_SCALE_MEDAPP_USER_INFO,
+                                      wp.tlv(T_SCALE_MEDAPP_USER_INFO,
+                                             struct.pack(">IHHBB", u["userId"], u["height_cm"], u["age"],
+                                                         u["sex"], u["fatmethod"]))), first=6.0, idle=1.0)
+    log("SCALE_MEDAPP_USER_INFO →", answer(fr))
+
+
 async def session(dev, out_path: str, delete: bool, secret: str | None,
-                  disable_wifi: bool, setup_ok: bool) -> int:
+                  disable_wifi: bool, setup_ok: bool, prov: dict | None = None) -> int:
     client = BleakClient(dev, timeout=40, disconnected_callback=lambda c: log("disconnected by peer"))
     await client.connect()
     log(f"connected, mtu={client.mtu_size}")
@@ -62,6 +92,9 @@ async def session(dev, out_path: str, delete: bool, secret: str | None,
         fr = await link.transact(wp.frame(wp.CMD_TIME_SET, wp.tlv(wp.T_TIME_SET, struct.pack(">IiIi", now, gmt_off, 0, gmt_off))),
                                  first=6.0, idle=1.0)
         log("TIME_SET →", [(t, v.hex()) for t, v in wp.tlvs_of(fr)] or "echo/none")
+
+        if prov and not reply.get("challenged"):  # настроечный режим (кнопка): весы принимают конфигурацию
+            await provision(link, prov)
 
         fr = await link.transact(wp.frame(CMD_CONNECT_REASON), first=6.0, idle=1.0)
         tl = dict(wp.tlvs_of(fr))
@@ -134,8 +167,13 @@ async def main():
     p.add_argument("--secret")
     p.add_argument("--disable-wifi", action="store_true")
     p.add_argument("--setup-ok", action="store_true")
+    p.add_argument("--provision", help="JSON с kl/adv_key/account_id и профилем: пишется в весы в настроечном режиме")
     p.add_argument("--upload-args", default="", help="аргументы для withings_upload.py, напр. '--userid 12345678 --mac 00:24:e4:xx:xx:xx'")
     args = p.parse_args()
+    prov = None
+    if args.provision:
+        with open(args.provision) as f:
+            prov = json.load(f)
     mac = args.address.upper()
     log("daemon start, waiting for", mac)
 
@@ -187,7 +225,7 @@ async def main():
             # «следующую» рекламу, которой не будет → сканер стопим и сразу создаём соединение
             await scanner.stop()
             try:
-                n = await session(dev, args.out, args.delete, args.secret, args.disable_wifi, args.setup_ok)
+                n = await session(dev, args.out, args.delete, args.secret, args.disable_wifi, args.setup_ok, prov)
                 log(f"session done, {n} new measurement(s)")
                 if n > 0:
                     upload()

@@ -1,0 +1,4 @@
+{"account_id": 12345678,
+ "kl": "<32-char kl from withings_klsecret.py>",
+ "adv_key": "<advertise_key from withings_klsecret.py>",
+ "user": {"userId": 12345678, "name": "ABC", "height_cm": 175, "age": 35, "sex": 0, "fatmethod": 3}}

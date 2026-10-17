@@ -365,7 +365,7 @@ async def probe_and_auth(link: Link, secret: str | None) -> dict:
     tl = dict(tlvs_of(frames))
     if cmd == CMD_PROBE and T_PROBE_REPLY in tl:
         print("== challenge НЕ потребовался")
-        return decode(T_PROBE_REPLY, tl[T_PROBE_REPLY])
+        return {**decode(T_PROBE_REPLY, tl[T_PROBE_REPLY]), "challenged": False}
     if cmd == CMD_PROBE_CHALLENGE and T_PROBE_CHALLENGE in tl:
         ch = decode(T_PROBE_CHALLENGE, tl[T_PROBE_CHALLENGE])
         mac, challenge = ch["mac"], bytes.fromhex(ch["challenge"])
@@ -384,7 +384,7 @@ async def probe_and_auth(link: Link, secret: str | None) -> dict:
         if T_PROBE_CHALLENGE_RESPONSE in tl:
             theirs = bytes.fromhex(decode(T_PROBE_CHALLENGE_RESPONSE, tl[T_PROBE_CHALLENGE_RESPONSE])["answer"])
             print("== устройство ответило на НАШ challenge:", "OK" if theirs == sha1_answer(ours, mac, secret) else "НЕ СОВПАЛО")
-        return decode(T_PROBE_REPLY, tl[T_PROBE_REPLY])
+        return {**decode(T_PROBE_REPLY, tl[T_PROBE_REPLY]), "challenged": True}
     sys.exit(f"неожиданный ответ на PROBE: cmd={cmd}")
 
 
