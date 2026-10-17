@@ -123,13 +123,19 @@ are bound to the client IP, so the Pi must log in by itself.
 
 ```bash
 ./venv/bin/python tools/withings_daemon.py --address 00:24:E4:xx:xx:xx \
-    --secret <kl> --delete --disable-wifi --setup-ok --out measurements.jsonl
+    --secret <kl> --delete --disable-wifi --setup-ok --scale-session --out measurements.jsonl
 ```
 
 Press the button once more (3 s, "Start app"). In this setup-mode session the daemon reads and clears the stored
 measurements, sends `WIFI_SETTINGS enable=0`, confirms `wifiConfigured: 0`, and closes with `SYNC_OK`, `SETUP_OK`,
 `DISCONNECT`. The display should not say "Setup failed" any more. From now on the scale advertises after every
 weigh-in and the daemon handles it without the button.
+
+`--scale-session` keeps the scale's user list alive the way Health Mate does: in every session the daemon opens a
+scale session in the Withings cloud on the scale's behalf and pushes it to the scale (`docs/protocol.md`, "Users on
+the scale"). Without it a scale that lost its users (battery change, reset) records weight only, with no user and no
+body composition. With it, the first weigh-in delivers the users and the next one shows your name and measures fat,
+water, muscle and bone.
 
 Run it under `setsid nohup … &` or a systemd unit; it restarts its scanner on its own and retries a failed connection
 on the next fresh advertisement.
@@ -191,6 +197,8 @@ across reboots, so nothing else needs re-doing.
 - `tools/withings_daemon.py` — the collector: scan, connect, session, JSONL, cloud upload.
 - `tools/withings_upload.py` — measurements → Withings cloud (`cgi-bin/measure action=store`, the scale's own format).
 - `tools/withings_klsecret.py` — fetch the scale's `kl` secret and your userid from the Withings cloud.
+- `tools/withings_scalesession.py` — open a scale session in the cloud on the scale's behalf and pack it into
+  `CMD_SCALE_SESSION` messages (the user list the scale needs to recognise you and compute body composition).
 - `tools/mgmt_fix.py`, `tools/agent.sh` — BlueZ plumbing (per-device connection parameters, auto-accepting agent).
 - `tools/openwithings.service`, `tools/run-daemon.sh.example` — systemd user unit to run the collector on boot.
 - `docs/protocol.md` — everything we know about WPP as spoken by the scale.
@@ -212,7 +220,8 @@ across reboots, so nothing else needs re-doing.
 ## Roadmap
 
 - Library layout (`openwithings.wpp`, `openwithings.ble`, `openwithings.cloud`, device drivers) and a CLI.
-- Own account key via `CMD_ASSOCIATION_KEYS_SET` after a factory reset, so no cloud login is needed at all.
+- Own account key via `CMD_ASSOCIATION_KEYS_SET` after a factory reset, and a locally built scale session, so no
+  cloud is needed at all.
 - Other scales (Body, Body Cardio, Body Comp/Scan share the protocol; only the service UUID model byte differs) and,
   with community help, the watches and BPM.
 - systemd unit, Home Assistant / MQTT output.

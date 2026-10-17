@@ -3,10 +3,12 @@
 Демон для Withings Body+: слушает эфир, при СВЕЖЕЙ рекламе весов подключается (сканер продолжает
 работать — bleak #631), ведёт сессию как Health Mate и складывает замеры в JSONL.
 
-Сессия: settle 2 с → notify → PROBE → CONNECT_REASON → STORED GETSTATE → [GETALL → save → DELALL]
+Сессия: settle 2 с → notify → PROBE → [FEATURE_MASK_GET → облачная сессия → SCALE_SESSION] → TIME_SET
+        → [ASSOCIATION_KEYS_SET] → CONNECT_REASON → STORED GETSTATE → [GETALL → save → DELALL]
         → [WIFI_GET_SETTINGS, WIFI_SETTINGS enable=0, GETSTATE] → SYNC_OK → [SETUP_OK] → DISCONNECT
 
   python3 withings_daemon.py --address 00:24:E4:xx:xx:xx --out measurements.jsonl --delete [--disable-wifi] [--setup-ok]
+                             [--scale-session] [--provision provision.json]
 """
 from __future__ import annotations
 
@@ -20,18 +22,17 @@ from datetime import datetime, timezone
 from bleak import BleakClient, BleakScanner
 
 import withings_probe as wp
+import withings_scalesession as ss
 
 CMD_WIFI_GET_SETTINGS = 260
 CMD_WIFI_SETTINGS = 265
 CMD_CONNECT_REASON = 273
 CMD_SYNC_OK = 277
 CMD_COMM_SUPPORT = 281
-CMD_UPDATE_USER_INFO = 276
-CMD_SCALE_MEDAPP_USER_INFO = 307
+CMD_FEATURE_MASK_GET = 305
 T_CONNECT_REASON = 280
 T_WIFI_ENABLE = 270
-T_USER_INFO = 282
-T_SCALE_MEDAPP_USER_INFO = 308
+T_FEATURE_MASK = 307
 REASONS = {0: "UNKNOWN", 1: "USER_REQ", 2: "DEVICE_REQ", 3: "FIRM_UPDATE", 4: "READY_TO_UPDATE",
            5: "RESCUE_FW", 6: "TRAINING", 7: "EVENT", 8: "BAT_LVL_INFO", 9: "WUP_SYNC_REQ", 10: "FEATURE_TAGS_SYNC"}
 
@@ -40,34 +41,46 @@ def log(*a):
     print(datetime.now().strftime("%H:%M:%S"), *a, flush=True)
 
 
-async def provision(link: wp.Link, prov: dict):
-    """Сброшенные весы (смена батареек) забывают kl и профиль: пишем их обратно, как Health Mate при настройке.
-    prov: {"account_id", "kl", "adv_key", "user": {"userId", "name", "height_cm", "age", "sex", "fatmethod"}}"""
-    def answer(fr):
-        tl = [(t, v.hex()) for t, v in wp.tlvs_of(fr)]
-        err = [wp.decode(t, bytes.fromhex(v)) for t, v in tl if t == wp.T_CMDERROR]
-        return f"ERROR {err}" if err else (tl or "echo")
+def answer(fr):
+    tl = [(t, v.hex()) for t, v in wp.tlvs_of(fr)]
+    err = [wp.decode(t, bytes.fromhex(v)) for t, v in tl if t == wp.T_CMDERROR]
+    return f"ERROR {err}" if err else (tl or "echo")
 
+
+async def provision(link: wp.Link, prov: dict):
+    """Сброшенные весы (смена батареек) забывают kl: пишем его обратно, как Health Mate при настройке.
+    prov: {"account_id", "kl", "adv_key"}. Пользователей Body+ получает не командами 276/307 (на них err −3),
+    а облачной сессией — см. send_scale_session."""
     fr = await link.transact(wp.frame(wp.CMD_ASSOCIATION_KEYS_SET,
                                       wp.tlv(wp.T_ACCOUNT_KEY, struct.pack(">I", prov["account_id"]) + wp.wstr(prov["kl"])),
                                       wp.tlv(wp.T_ADV_KEY, wp.wstr(prov["adv_key"]))), first=6.0, idle=1.0)
     log("ASSOCIATION_KEYS_SET →", answer(fr))
-    u = prov.get("user")
-    if not u:
+
+
+async def send_scale_session(link: wp.Link, reply: dict):
+    """Как Health Mate (SendSessionConversation): открыть облачную сессию за весы и залить её в весы.
+    Из неё весы узнают пользователей (имя на экране, рост/возраст/пол для состава тела). Сбой облака или
+    отказ весов не мешает остальной сессии — замеры всё равно забираются."""
+    fr = await link.transact(wp.frame(CMD_FEATURE_MASK_GET), first=4.0, idle=0.8)
+    tl = dict(wp.tlvs_of(fr))
+    mask = struct.unpack(">I", tl[T_FEATURE_MASK][:4])[0] if len(tl.get(T_FEATURE_MASK, b"")) >= 4 else None
+    log("FEATURE_MASK_GET →", mask if mask is not None else answer(fr))
+    try:
+        body = await asyncio.wait_for(asyncio.to_thread(
+            ss.open_session, reply["mac"], reply["secret"], reply["mfgId"], int(reply["softVersion"]), None, mask), 25)
+    except Exception as e:  # noqa: BLE001
+        log("scale session: cloud failed, skipping:", repr(e))
         return
-    fr = await link.transact(wp.frame(CMD_UPDATE_USER_INFO,
-                                      wp.tlv(T_USER_INFO, wp.wstr(u["name"]) + struct.pack(">II", u["userId"], 0))),
-                             first=6.0, idle=1.0)
-    log("UPDATE_USER_INFO →", answer(fr))
-    fr = await link.transact(wp.frame(CMD_SCALE_MEDAPP_USER_INFO,
-                                      wp.tlv(T_SCALE_MEDAPP_USER_INFO,
-                                             struct.pack(">IHHBB", u["userId"], u["height_cm"], u["age"],
-                                                         u["sex"], u["fatmethod"]))), first=6.0, idle=1.0)
-    log("SCALE_MEDAPP_USER_INFO →", answer(fr))
+    log("scale session: users", ss.describe(body))
+    msgs = ss.session_messages(body)
+    for m in msgs[:-1]:
+        await link.send(m)
+    fr = await link.transact(msgs[-1], first=8.0, idle=1.0)
+    log(f"SCALE_SESSION ({len(msgs)} msg) →", answer(fr))
 
 
 async def session(dev, out_path: str, delete: bool, secret: str | None,
-                  disable_wifi: bool, setup_ok: bool, prov: dict | None = None) -> int:
+                  disable_wifi: bool, setup_ok: bool, prov: dict | None = None, scale_session: bool = False) -> int:
     client = BleakClient(dev, timeout=40, disconnected_callback=lambda c: log("disconnected by peer"))
     await client.connect()
     log(f"connected, mtu={client.mtu_size}")
@@ -85,6 +98,9 @@ async def session(dev, out_path: str, delete: bool, secret: str | None,
 
         reply = await wp.probe_and_auth(link, secret)
         log("ProbeReply:", reply.get("name"), "fw", reply.get("softVersion"), "mac", reply.get("mac"))
+
+        if scale_session:  # первым шагом init, как в Health Mate
+            await send_scale_session(link, reply)
 
         # RTC весов сбрасывается при смене батареек → выставляем время в каждой сессии (Health Mate делает так же)
         now = int(time.time())
@@ -167,7 +183,10 @@ async def main():
     p.add_argument("--secret")
     p.add_argument("--disable-wifi", action="store_true")
     p.add_argument("--setup-ok", action="store_true")
-    p.add_argument("--provision", help="JSON с kl/adv_key/account_id и профилем: пишется в весы в настроечном режиме")
+    p.add_argument("--provision", help="JSON с kl/adv_key/account_id: пишется в весы в настроечном режиме")
+    p.add_argument("--scale-session", action="store_true",
+                   help="в каждой сессии открывать облачную сессию за весы и заливать её в весы (пользователи, "
+                        "рост/возраст/пол для состава тела), как Health Mate")
     p.add_argument("--upload-args", default="", help="аргументы для withings_upload.py, напр. '--userid 12345678 --mac 00:24:e4:xx:xx:xx'")
     args = p.parse_args()
     prov = None
@@ -225,13 +244,14 @@ async def main():
             # «следующую» рекламу, которой не будет → сканер стопим и сразу создаём соединение
             await scanner.stop()
             try:
-                n = await session(dev, args.out, args.delete, args.secret, args.disable_wifi, args.setup_ok, prov)
+                n = await session(dev, args.out, args.delete, args.secret, args.disable_wifi, args.setup_ok, prov,
+                                  args.scale_session)
                 log(f"session done, {n} new measurement(s)")
                 if n > 0:
                     upload()
                     next_upload = time.monotonic() + 600
                 break
-            except Exception as e:  # noqa: BLE001
+            except (Exception, SystemExit) as e:  # noqa: BLE001 — probe_and_auth зовёт sys.exit при обрыве на challenge
                 log(f"attempt {attempt} failed: {e!r}")
             finally:
                 while not queue.empty():

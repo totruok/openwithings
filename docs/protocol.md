@@ -54,11 +54,13 @@ CMD_PROBE (257)          [AppProbe(298){os u8=1 Android, app u8=1 HealthMate, ve
   ← normal mode: CMD_PROBE_CHALLENGE (296) with ProbeChallenge(290){mac str, challenge bytes[16]}
 CMD_PROBE_CHALLENGE (296) [ProbeChallengeResponse(291){answer = SHA1(challenge || mac_str || kl)}] [ProbeChallenge(290){mac, our 16 random bytes}]
   ← CMD_PROBE with ProbeChallengeResponse (their answer to our challenge, same formula) + ProbeReply
+CMD_FEATURE_MASK_GET (305) []                                                                            ← FeatureMask(307){mask u32}  (0 on a reset scale, 3 after a session)
+CMD_SCALE_SESSION (269)  [ScaleSession(274){data str}]* … [Null]   the user list, see "Users on the scale" ← echo
 CMD_TIME_SET (1281)      [TimeSet(1281){utc u32, gmtOffset i32, dstChangeTime u32, nextGmtOffset i32}]  ← TimeSetReply(1282){drift i32}
 CMD_CONNECT_REASON (273) []                                                                              ← ConnectReason(280){u16}  1 USER_REQ (button), 2 DEVICE_REQ (weigh-in)
 CMD_STORED_MEASURE (271) [StoredMeasureAction(276){cmd u8=0 GETSTATE, rc i8}]                            ← StoredMeasureStatus(277){cnt i16, oldestMeasTime i32, wifiConfigured i8}
 CMD_STORED_MEASURE (271) [StoredMeasureAction{cmd=1 GETALL}]                                             ← per measurement: StoredMeasureMeta(278) StoredMeasureMetaExtend(299) StoredMeasureData(279)* … Null
-CMD_STORED_MEASURE (271) [StoredMeasureAction{cmd=2 DELALL}]                                             ← echo
+CMD_STORED_MEASURE (271) [StoredMeasureAction{cmd=2 DELALL}]                                             ← echo; rc=-1 while the scale has no users
 (optional, setup mode) CMD_WIFI_GET_SETTINGS (260) → TLV 260 with the SSID; CMD_WIFI_SETTINGS (265) [WifiEnable(270){enable i8=0}] → echo; GETSTATE now says wifiConfigured=0
 CMD_SYNC_OK (277) []     ← echo        ALWAYS. Skip it and the scale ignores you on the next connection.
 CMD_SETUP_OK (275) []    ← echo        in setup-mode sessions; without it the display shows "Setup failed"
@@ -67,6 +69,35 @@ CMD_DISCONNECT (272) []  ← echo, then the scale drops the link itself
 
 `ProbeReply(257)`: vid u16, pid u16, name str, mac str, secret str (16 hex chars, **not** the `kl` secret),
 hardVersion u32, mfgId str, blVersion u32, softVersion u32, rescueVersion u32.
+
+## Users on the scale: the cloud scale session
+
+The scale learns who its users are (3-letter name on the display, average weight to tell people apart, height, age,
+sex and fat method, without which there is no body composition) from a **scale session** of the old Wi-Fi protocol
+(the one WBS01/WS-30 speak, see `mncoppola/ws30`). In Wi-Fi mode the scale opens it itself. In Bluetooth mode the
+app opens it on the scale's behalf and pushes it down with `CMD_SCALE_SESSION`, as the first init step of every
+weigh-in sync and of setup. `CMD_UPDATE_USER_INFO` (276) and `CMD_SCALE_MEDAPP_USER_INFO` (307) are not for this
+scale: Body+ fw 1651 answers both with err −3. Source: Health Mate 26.42.0 (202610080), `ScaleSyncConversation` →
+`InitConversation` (Body+ is model 5) → `SendSessionConversation`; confirmed on the scale 2026-10-17.
+
+Cloud side, no account login needed (`tools/withings_scalesession.py`):
+
+```
+POST https://scalews.withings.net/cgi-bin/once     action=get                      → {"status":0,"body":{"once":"xxxxxxxx-xxxxxxxx"}}
+POST https://scalews.withings.net/cgi-bin/session  action=new auth=<ProbeReply.mac>
+     hash=md5("<ProbeReply.mac>:<ProbeReply.secret>:<once>")  duration=600  currentfw=<ProbeReply.softVersion>
+     mfgid=int(<ProbeReply.mfgId>, 16)  [batterylvl]  battery_state=-1  [feature_mask]  enrich=t
+     last_used_network=2  httpslink=3
+  → {"status":0,"body":{"sessionid":…, "sp":{"users":[{"id":12345678,"sn":"ABC","wt":80.1,"ht":1.8,"agt":35.1,
+     "sx":0,"fm":3,"cr":<last measure>,"att":0,"ft":[],"fn":"First","cs":"11,6,1,…"}]},
+     "ind":{"lg":"en_EN",…}, "syp":{"utc":…,"fwupd":"false"}, "ctp":{"goff":10800,"dst":0,"ngoff":0}, "color":"black"}}
+```
+
+BLE side: `data = '{"status":0,"body":' + compact(body) + '}' + '\0'` (the last two characters are a literal backslash
+and zero, exactly as in the APK). Cut `data` into pieces of at most 64 bytes, one `ScaleSession(274)` TLV each
+(1-byte string length as usual), then a `Null(256)` TLV. Pack the TLVs into `CMD_SCALE_SESSION` messages of at
+most 200 bytes (two pieces per message), send them back to back, and wait for one `CMD_SCALE_SESSION` echo. On the next
+weigh-in the scale shows the name and measures impedance: `userId [12345678, 0, 0]`, `algo 3`, fat, water, muscle, bone.
 
 ## Stored measurements
 
@@ -99,9 +130,15 @@ by the cloud. Sessions come from `POST https://scalews.withings.net/cgi-bin/auth
 are bound to the client IP, and last up to 7 days. The `kl` secret comes from
 `cgi-bin/association action=getbyaccountid enrich=t` (`kl`, plus `deviceproperties.advertise_key`).
 
+## After a battery change
+
+The scale forgets the bond, `kl` and its users. `CMD_ASSOCIATION_KEYS_SET` (308) with
+`AccountKey(309){id u32, secret str}` + `AdvKey(310){secret str}` restores `kl` in a setup-mode session (one button
+press; the daemon's `--provision`). The users come back by themselves with the next scale session (`--scale-session`):
+the first weigh-in delivers it, the second one is attributed and has body composition.
+
 ## Not yet explored
 
-- `CMD_ASSOCIATION_KEYS_SET` (308) with `AccountKey(309){id u32, secret str}` + `AdvKey(310){secret str}` on a
-  factory-reset scale — would remove the need for the cloud login entirely (works on watches, see `references/pairing.rs`).
-- `CMD_SCALE_MEDAPP_USER_INFO` (307) `{userId u32, height u16, age u16, sex u8, fatmethod u8}` — user profile for BIA.
-- `CMD_DISCONNECT_AND_FAST_ADV` (2323), `CMD_COMM_SUPPORT` (281), the `SCALE_SESSION` (269) string.
+- `CMD_DISCONNECT_AND_FAST_ADV` (2323), `CMD_COMM_SUPPORT` (281).
+- A scale session built locally instead of fetched from scalews (the scale has no way to check it), which would
+  remove the last cloud dependency.
